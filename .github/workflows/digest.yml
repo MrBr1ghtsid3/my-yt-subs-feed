@@ -1,34 +1,26 @@
-name: YouTube digest
+name: YouTube feed
 
 on:
   schedule:
-    # GitHub cron is always UTC and often runs 10-60 min late.
-    # 05:43 UTC = 06:43 UK summer / 05:43 UK winter / 08:43 Sofia summer.
-    - cron: "43 5 * * *"
+    # Every 3 hours at minute 17, UTC. GitHub often starts scheduled runs
+    # 10-60 minutes late, and off-the-hour minutes are delayed less.
+    - cron: "17 */3 * * *"
   workflow_dispatch: {}
-
-permissions:
-  contents: write
 
 concurrency:
   group: yt-digest
   cancel-in-progress: false
 
 jobs:
-  digest:
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write # commit state.json back
     steps:
       - uses: actions/checkout@v5
 
-      - name: Build and email digest
-        env:
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          DIGEST_TO: ${{ secrets.DIGEST_TO }}
-          DIGEST_FROM: ${{ secrets.DIGEST_FROM }}
+      - name: Build feed and page
         run: python3 yt_digest.py run
 
       - name: Save state
@@ -39,15 +31,31 @@ jobs:
           if git diff --cached --quiet; then
             echo "State unchanged."
           else
-            git commit -m "Update digest state"
+            git commit -m "Update feed state"
+            git pull --rebase
             git push
           fi
 
-      - name: Keep digest and feed as a run artifact
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Collect site files
+        run: |
+          mkdir -p _site
+          cp output/index.html output/feed.xml _site/
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v4
         with:
-          name: digest
-          path: output/
-          retention-days: 7
-          if-no-files-found: ignore
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write # publish to GitHub Pages
+      id-token: write # prove to Pages that this run is allowed to publish
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

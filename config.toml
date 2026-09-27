@@ -1,6 +1,11 @@
 # yt-digest settings. Every key is optional; defaults are shown.
 
-# Times in the digest are shown in this zone (IANA name).
+# Address of the published GitHub Pages site. Used for the feed's own
+# address (rel="self") and the feed link on the page. Change it if your
+# GitHub user name or repo name changes.
+site_url = "https://mrbr1ghtsid3.github.io/yt-digest/"
+
+# Times on the page and in the feed are shown in this zone (IANA name).
 # "Europe/Sofia" for Bulgarian time.
 timezone = "Europe/London"
 
@@ -10,20 +15,18 @@ summary_max_chars = 280
 # Leave out Shorts and past livestreams.
 videos_only = true
 
-# Send an email even on days with nothing new.
-send_empty = false
-
-# First run only: how far back to look. After that the digest covers
-# everything since the previous run.
+# First run only: how far back to look for the local text digest. After
+# that the digest covers everything since the previous run.
 lookback_hours = 48
 
-# How long seen videos are remembered and kept in the Atom feed.
+# How long seen videos are remembered and kept on the page and in the feed.
 retain_days = 30
 
 channels_file = "channels.txt"
 state_file = "state.json"
-digest_file = "output/digest.txt"
+page_file = "output/index.html"
 feed_file = "output/feed.xml"
+digest_file = "output/digest.txt"
 feed_title = "YouTube subscriptions (text only)"
 feed_max_items = 300
 workers = 6

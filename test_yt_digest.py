@@ -1,3 +1,5 @@
+import contextlib
+import io
 import tempfile
 import unittest
 import urllib.error
@@ -140,13 +142,16 @@ class RunTests(unittest.TestCase):
         )
         self.cfg = dict(yd.DEFAULTS)
         self.yt = FakeYouTube()
-        self.sent = []
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def send(self, subject, body):
-        self.sent.append((subject, body))
+    def run_at(self, now):
+        rc = yd.run(self.cfg, self.base, get=self.yt, now=now)
+        return rc, (self.base / "output/digest.txt").read_text(encoding="utf-8")
+
+    def page(self):
+        return (self.base / "output/index.html").read_text(encoding="utf-8")
 
     def test_full_cycle(self):
         # A: playlist feed with one fresh video and one old one (outside first-run window).
@@ -160,11 +165,9 @@ class RunTests(unittest.TestCase):
             entry("bs", "Short B", iso(2), "x", "Channel B", shorts=True),
         ]), playlist=False)
 
-        rc = yd.run(self.cfg, self.base, get=self.yt, send=self.send, now=NOW)
+        rc, body = self.run_at(NOW)
         self.assertEqual(rc, 0)
-        self.assertEqual(len(self.sent), 1)
-        subject, body = self.sent[0]
-        self.assertEqual(subject, "YouTube digest: 2 new")
+        self.assertIn("2 new uploads from 2 channels", body)
         self.assertIn("Title:    Fresh A", body)
         self.assertIn("Title:    Fresh B & more", body)
         self.assertNotIn("Old A", body)
@@ -183,52 +186,122 @@ class RunTests(unittest.TestCase):
         self.assertEqual(titles[0], "Channel A: Fresh A")
         self.assertIn("Channel A: Old A", titles)
 
-        # Second run, same feeds plus one new upload -> only the new one is sent.
+        # Page: same items, newest first, no Shorts.
+        page = self.page()
+        self.assertLess(page.index("Fresh A"), page.index("Fresh B &amp; more"))
+        self.assertLess(page.index("Fresh B &amp; more"), page.index("Old A"))
+        self.assertNotIn("Short B", page)
+
+        # Second run, same feeds plus one new upload -> only the new one is in the digest.
         later = NOW + timedelta(days=1)
         self.yt.set(CH_A, feed("Channel A", [
             entry("a2", "Next day A", (later - timedelta(hours=1)).isoformat(), "New one.", "Channel A"),
             entry("a1", "Fresh A", iso(3), NOISY, "Channel A"),
         ]))
-        yd.run(self.cfg, self.base, get=self.yt, send=self.send, now=later)
-        self.assertEqual(len(self.sent), 2)
-        self.assertEqual(self.sent[1][0], "YouTube digest: 1 new")
-        self.assertIn("Next day A", self.sent[1][1])
-        self.assertNotIn("Title:    Fresh A", self.sent[1][1])
+        _, body = self.run_at(later)
+        self.assertIn("1 new upload from 1 channel", body)
+        self.assertIn("Next day A", body)
+        self.assertNotIn("Title:    Fresh A", body)
+        self.assertLess(self.page().index("Next day A"), self.page().index("Fresh A"))
 
-        # Third run, nothing new -> no email by default.
-        yd.run(self.cfg, self.base, get=self.yt, send=self.send, now=later + timedelta(days=1))
-        self.assertEqual(len(self.sent), 2)
+        # Third run, nothing new.
+        _, body = self.run_at(later + timedelta(days=1))
+        self.assertIn("No new uploads.", body)
 
     def test_missed_days_are_caught_up(self):
         self.yt.set(CH_A, feed("Channel A", []))
         self.yt.set(CH_B, feed("Channel B", []))
-        yd.run(self.cfg, self.base, get=self.yt, send=self.send, now=NOW)
+        self.run_at(NOW)
         # Runner down for four days; a video from 3.5 days ago must still arrive.
         later = NOW + timedelta(days=4)
         self.yt.set(CH_A, feed("Channel A", [
             entry("gap", "Posted during outage", (later - timedelta(hours=84)).isoformat(), "x", "Channel A"),
         ]))
-        yd.run(self.cfg, self.base, get=self.yt, send=self.send, now=later)
-        self.assertIn("Posted during outage", self.sent[-1][1])
-
-    def test_failed_email_keeps_state(self):
-        self.yt.set(CH_A, feed("Channel A", [entry("a1", "Fresh A", iso(3), "x", "Channel A")]))
-
-        def boom(subject, body):
-            raise OSError("SMTP down")
-
-        with self.assertRaises(OSError):
-            yd.run(self.cfg, self.base, get=self.yt, send=boom, now=NOW)
-        self.assertFalse((self.base / "state.json").exists())
-        yd.run(self.cfg, self.base, get=self.yt, send=self.send, now=NOW + timedelta(hours=1))
-        self.assertIn("Fresh A", self.sent[0][1])
+        _, body = self.run_at(later)
+        self.assertIn("Posted during outage", body)
 
     def test_all_failed_leaves_state(self):
         (self.base / "channels.txt").write_text(f"{CH_C}\n")
-        rc = yd.run(self.cfg, self.base, get=self.yt, send=self.send, now=NOW)
+        rc = yd.run(self.cfg, self.base, get=self.yt, now=NOW)
         self.assertEqual(rc, 1)
         self.assertFalse((self.base / "state.json").exists())
-        self.assertEqual(self.sent, [])
+
+    def test_unknown_timezone_gives_tzdata_hint(self):
+        self.cfg["timezone"] = "Nowhere/Invalid"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = yd.run(self.cfg, self.base, get=self.yt, now=NOW)
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.yt.calls, [])  # stops before fetching anything
+        msg = err.getvalue().strip()
+        self.assertEqual(msg.count("\n"), 0)
+        self.assertIn("python -m pip install tzdata", msg)
+
+
+class PageTests(unittest.TestCase):
+    SITE = "https://example.github.io/yt-digest/"
+
+    def build(self, title="Plain title", channel="Channel A", summary="A summary."):
+        v = yd.Video(
+            id="v1", channel_id=CH_A, channel=channel, title=title,
+            url="https://www.youtube.com/watch?v=v1", published=iso(3), summary=summary,
+        )
+        cfg = dict(yd.DEFAULTS, site_url=self.SITE)
+        return yd.build_html([v], cfg, yd.ZoneInfo("Europe/London"), NOW).decode("utf-8")
+
+    def test_no_images_scripts_or_external_files(self):
+        page = self.build().lower()
+        for bad in ("<img", "<script", "<svg", "<iframe", "stylesheet", "@import", "url(", "ytimg"):
+            self.assertNotIn(bad, page)
+
+    def test_text_is_escaped(self):
+        page = self.build(
+            title='<script>alert("x")</script> & more',
+            channel="Tom & Jerry <b>",
+            summary="1 < 2 and <img src=x onerror=alert(1)>",
+        )
+        self.assertNotIn("<script", page)
+        self.assertNotIn("<img", page)
+        self.assertNotIn("<b>", page)
+        self.assertIn("&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; more", page)
+        self.assertIn("Tom &amp; Jerry &lt;b&gt;", page)
+        self.assertIn("1 &lt; 2 and &lt;img src=x onerror=alert(1)&gt;", page)
+
+    def test_feed_link_and_autodiscovery(self):
+        page = self.build()
+        feed = self.SITE + "feed.xml"
+        self.assertIn(f'<link rel="alternate" type="application/atom+xml" title="YouTube subscriptions (text only)" href="{feed}">', page)
+        self.assertIn(f'<a href="{feed}">', page)
+
+    def test_entry_fields(self):
+        page = self.build()
+        self.assertIn('<a href="https://www.youtube.com/watch?v=v1">Plain title</a>', page)
+        self.assertIn("Channel A", page)
+        self.assertIn("Sun 27 Sep 2026, 07:00 BST", page)
+        self.assertIn("A summary.", page)
+
+    def test_non_https_link_is_replaced(self):
+        v = yd.Video("v1", CH_A, "A", "T", "javascript:alert(1)", iso(3), "s")
+        page = yd.build_html([v], dict(yd.DEFAULTS), yd.ZoneInfo("UTC"), NOW).decode()
+        self.assertNotIn("javascript:", page)
+        self.assertIn('href="https://www.youtube.com/watch?v=v1"', page)
+
+    def test_empty_page(self):
+        page = yd.build_html([], dict(yd.DEFAULTS), yd.ZoneInfo("UTC"), NOW).decode()
+        self.assertIn("No uploads yet.", page)
+        self.assertIn('href="feed.xml"', page)  # relative when no site_url
+
+
+class AtomTests(unittest.TestCase):
+    def test_self_link(self):
+        cfg = dict(yd.DEFAULTS, site_url="https://example.github.io/yt-digest")
+        root = ET.fromstring(yd.build_atom([], cfg, yd.ZoneInfo("UTC"), NOW))
+        link = root.find(f"{{{yd.ATOM}}}link[@rel='self']")
+        self.assertEqual(link.get("href"), "https://example.github.io/yt-digest/feed.xml")
+
+    def test_no_self_link_without_site_url(self):
+        root = ET.fromstring(yd.build_atom([], dict(yd.DEFAULTS), yd.ZoneInfo("UTC"), NOW))
+        self.assertIsNone(root.find(f"{{{yd.ATOM}}}link"))
 
 
 class ImportTests(unittest.TestCase):

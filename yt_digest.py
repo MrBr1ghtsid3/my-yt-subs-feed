@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""yt-digest — a text-only digest of your YouTube subscriptions.
+"""yt-digest — a text-only feed and web page of your YouTube subscriptions.
 
 Each entry shows: channel name, title, date/time, and a short summary of the
 description. No thumbnails, no view counts, no notifications.
@@ -7,7 +7,7 @@ description. No thumbnails, no view counts, no notifications.
 Commands
   import-takeout PATH   Build/extend channels.txt from a Google Takeout subscriptions.csv
   add REF [REF ...]     Add channels by URL, @handle or UC… channel ID
-  run                   Fetch feeds, write the digest and Atom feed, email if configured
+  run                   Fetch feeds, write the Atom feed, web page and text digest
 
 Standard library only (Python 3.11+).
 """
@@ -15,26 +15,23 @@ from __future__ import annotations
 
 import argparse
 import csv
-import email.utils
+import html
 import json
-import os
 import re
-import smtplib
-import ssl
 import sys
 import time
 import tomllib
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
-from email.message import EmailMessage
 from pathlib import Path
 from typing import Callable
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ATOM = "http://www.w3.org/2005/Atom"
 NS = {
@@ -51,14 +48,15 @@ DEFAULTS = {
     "channels_file": "channels.txt",
     "state_file": "state.json",
     "feed_file": "output/feed.xml",
+    "page_file": "output/index.html",
     "digest_file": "output/digest.txt",
     "feed_title": "YouTube subscriptions (text only)",
+    "site_url": "",
     "summary_max_chars": 280,
     "lookback_hours": 48,
     "retain_days": 30,
     "feed_max_items": 300,
     "videos_only": True,
-    "send_empty": False,
     "workers": 6,
 }
 
@@ -369,6 +367,8 @@ def build_atom(items: list[Video], cfg: dict, tz: ZoneInfo, now: datetime) -> by
     feed = ET.Element(f"{{{ATOM}}}feed")
     sub(feed, "title", cfg["feed_title"])
     sub(feed, "id", "urn:yt-digest:feed")
+    if cfg["site_url"]:
+        sub(feed, "link", rel="self", type="application/atom+xml", href=site_link(cfg, "feed.xml"))
     sub(feed, "updated", now.isoformat())
     author = sub(feed, "author")
     sub(author, "name", "yt-digest")
@@ -387,33 +387,75 @@ def build_atom(items: list[Video], cfg: dict, tz: ZoneInfo, now: datetime) -> by
     return ET.tostring(feed, encoding="utf-8", xml_declaration=True)
 
 
-def email_configured() -> bool:
-    return bool(os.environ.get("SMTP_HOST") and os.environ.get("DIGEST_TO"))
+def site_link(cfg: dict, name: str) -> str:
+    """Absolute URL on the published site if site_url is set, else a relative one."""
+    base = cfg["site_url"]
+    return f"{base.rstrip('/')}/{name}" if base else name
 
 
-def send_email(subject: str, body: str) -> None:
-    host = os.environ["SMTP_HOST"]
-    port = int(os.environ.get("SMTP_PORT", "465"))
-    user = os.environ.get("SMTP_USER", "")
-    password = os.environ.get("SMTP_PASSWORD", "")
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = os.environ.get("DIGEST_FROM") or user
-    msg["To"] = os.environ["DIGEST_TO"]
-    msg["Date"] = email.utils.formatdate(localtime=True)
-    msg.set_content(body)
-    ctx = ssl.create_default_context()
-    if port == 465:
-        with smtplib.SMTP_SSL(host, port, context=ctx, timeout=30) as s:
-            if user:
-                s.login(user, password)
-            s.send_message(msg)
-    else:
-        with smtplib.SMTP(host, port, timeout=30) as s:
-            s.starttls(context=ctx)
-            if user:
-                s.login(user, password)
-            s.send_message(msg)
+PAGE_CSS = """
+:root { color-scheme: light dark; --bg: #fbfbf8; --fg: #1d1d1b; --muted: #5f5f5a; --rule: #deded8; --link: #1a55b0; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #161614; --fg: #e8e8e3; --muted: #a3a39c; --rule: #33332f; --link: #8ab4f8; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+       font: 1rem/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-text-size-adjust: 100%; }
+main { max-width: 42rem; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
+header { border-bottom: 1px solid var(--rule); padding-bottom: 1rem; }
+h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
+a { color: var(--link); }
+.meta { color: var(--muted); font-size: .875rem; margin: .15rem 0; }
+article { padding: 1rem 0; border-bottom: 1px solid var(--rule); }
+.ch { color: var(--muted); font-size: .8125rem; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; margin: 0; }
+h2 { font-size: 1.0625rem; line-height: 1.35; margin: .2rem 0; overflow-wrap: anywhere; }
+article p { margin: .2rem 0; overflow-wrap: anywhere; }
+"""
+
+
+def _video_href(v: Video) -> str:
+    if v.url.startswith("https://"):
+        return v.url
+    return "https://www.youtube.com/watch?v=" + urllib.parse.quote(v.id)
+
+
+def build_html(items: list[Video], cfg: dict, tz: ZoneInfo, now: datetime) -> bytes:
+    """Plain web page of the same items as the feed: no images, no scripts, no external files."""
+    esc = html.escape
+    title = esc(cfg["feed_title"])
+    feed_href = esc(site_link(cfg, "feed.xml"))
+    count = f"{len(items)} upload{'s' * (len(items) != 1)} from the last {cfg['retain_days']} days"
+    out = [
+        "<!doctype html>",
+        '<html lang="en">',
+        "<head>",
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        f"<title>{title}</title>",
+        f'<link rel="alternate" type="application/atom+xml" title="{title}" href="{feed_href}">',
+        f"<style>{PAGE_CSS}</style>",
+        "</head>",
+        "<body>",
+        "<main>",
+        "<header>",
+        f"<h1>{title}</h1>",
+        f'<p class="meta">{count}. Updated {esc(fmt_local(now, tz))}.</p>',
+        f'<p class="meta"><a href="{feed_href}">Subscribe in a feed reader (feed.xml)</a></p>',
+        "</header>",
+    ]
+    for v in items:
+        out += [
+            "<article>",
+            f'<p class="ch">{esc(v.channel)}</p>',
+            f'<h2><a href="{esc(_video_href(v))}">{esc(v.title)}</a></h2>',
+            f'<p class="meta"><time datetime="{esc(v.published)}">{esc(fmt_local(v.published_dt, tz))}</time></p>',
+            f"<p>{esc(v.summary)}</p>",
+            "</article>",
+        ]
+    if not items:
+        out.append("<p>No uploads yet.</p>")
+    out += ["</main>", "</body>", "</html>", ""]
+    return "\n".join(out).encode("utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -425,12 +467,15 @@ def run(
     cfg: dict,
     base: Path,
     get: Callable[[str], bytes] = http_get,
-    send: Callable[[str, str], None] | None = None,
     now: datetime | None = None,
     print_digest: bool = False,
 ) -> int:
     now = now or datetime.now(timezone.utc)
-    tz = ZoneInfo(cfg["timezone"])
+    try:
+        tz = ZoneInfo(cfg["timezone"])
+    except ZoneInfoNotFoundError:
+        print(f'Time zone "{cfg["timezone"]}" not found. Run: python -m pip install tzdata', file=sys.stderr)
+        return 2
     channels = load_channels(base / cfg["channels_file"])
     if not channels:
         print(f"No channels in {cfg['channels_file']}. Run import-takeout or add first.", file=sys.stderr)
@@ -464,9 +509,11 @@ def run(
 
     digest = build_digest(new, failures, tz, now)
     all_items = sorted((Video(**d) for d in items.values()), key=lambda v: v.published, reverse=True)
+    shown = all_items[: cfg["feed_max_items"]]
     for rel, data in (
         (cfg["digest_file"], digest.encode("utf-8")),
-        (cfg["feed_file"], build_atom(all_items[: cfg["feed_max_items"]], cfg, tz, now)),
+        (cfg["feed_file"], build_atom(shown, cfg, tz, now)),
+        (cfg["page_file"], build_html(shown, cfg, tz, now)),
     ):
         out = base / rel
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -481,11 +528,6 @@ def run(
     if ok == 0:
         print("Every channel failed; state left unchanged so nothing is lost.", file=sys.stderr)
         return 1
-
-    if send and (new or cfg["send_empty"]):
-        subject = f"YouTube digest: {len(new)} new" if new else "YouTube digest: nothing new"
-        send(subject, digest)  # raises on failure -> state not saved -> retried next run
-        print("Digest emailed.")
 
     state.update(version=1, last_run=now.isoformat(), items=items)
     save_state(state_path, state)
@@ -552,9 +594,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("csv", type=Path)
     s = sp.add_parser("add", help="add channels by URL, @handle or channel ID")
     s.add_argument("refs", nargs="+")
-    s = sp.add_parser("run", help="build the digest and feed; email if SMTP is configured")
-    s.add_argument("--print", action="store_true", help="also print the digest to stdout")
-    s.add_argument("--no-email", action="store_true", help="skip email even if SMTP is configured")
+    s = sp.add_parser("run", help="build the feed, web page and text digest")
+    s.add_argument("--print", action="store_true", help="also print the digest of new uploads")
     args = p.parse_args(argv)
 
     cfg_path = Path(args.config).resolve()
@@ -581,8 +622,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{added} added to {cfg['channels_file']}.")
         return 0 if resolved else 1
 
-    send = send_email if (email_configured() and not args.no_email) else None
-    return run(cfg, base, send=send, print_digest=args.print)
+    return run(cfg, base, print_digest=args.print)
 
 
 if __name__ == "__main__":
