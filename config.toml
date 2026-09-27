@@ -3,7 +3,7 @@
 # Address of the published GitHub Pages site. Used for the feed's own
 # address (rel="self") and the feed link on the page. Change it if your
 # GitHub user name or repo name changes.
-site_url = "https://mrbr1ghtsid3.github.io/yt-digest/"
+site_url = "https://mrbr1ghtsid3.github.io/my-yt-subs-feed/"
 
 # Times on the page and in the feed are shown in this zone (IANA name).
 # "Europe/Sofia" for Bulgarian time.
