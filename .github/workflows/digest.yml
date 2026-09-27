@@ -1,0 +1,53 @@
+name: YouTube digest
+
+on:
+  schedule:
+    # GitHub cron is always UTC and often runs 10-60 min late.
+    # 05:43 UTC = 06:43 UK summer / 05:43 UK winter / 08:43 Sofia summer.
+    - cron: "43 5 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: yt-digest
+  cancel-in-progress: false
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build and email digest
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          DIGEST_TO: ${{ secrets.DIGEST_TO }}
+          DIGEST_FROM: ${{ secrets.DIGEST_FROM }}
+        run: python3 yt_digest.py run
+
+      - name: Save state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "State unchanged."
+          else
+            git commit -m "Update digest state"
+            git push
+          fi
+
+      - name: Keep digest and feed as a run artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest
+          path: output/
+          retention-days: 7
+          if-no-files-found: ignore

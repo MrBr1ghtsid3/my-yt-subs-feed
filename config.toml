@@ -1,0 +1,29 @@
+# yt-digest settings. Every key is optional; defaults are shown.
+
+# Times in the digest are shown in this zone (IANA name).
+# "Europe/Sofia" for Bulgarian time.
+timezone = "Europe/London"
+
+# Summary length in characters (cut at a sentence end where possible).
+summary_max_chars = 280
+
+# Leave out Shorts and past livestreams.
+videos_only = true
+
+# Send an email even on days with nothing new.
+send_empty = false
+
+# First run only: how far back to look. After that the digest covers
+# everything since the previous run.
+lookback_hours = 48
+
+# How long seen videos are remembered and kept in the Atom feed.
+retain_days = 30
+
+channels_file = "channels.txt"
+state_file = "state.json"
+digest_file = "output/digest.txt"
+feed_file = "output/feed.xml"
+feed_title = "YouTube subscriptions (text only)"
+feed_max_items = 300
+workers = 6

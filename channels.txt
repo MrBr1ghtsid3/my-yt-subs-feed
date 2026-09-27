@@ -1,0 +1,3 @@
+# One channel per line: channel ID, then an optional "# name" comment.
+# Fill this with:   python3 yt_digest.py import-takeout subscriptions.csv
+# or add singles:   python3 yt_digest.py add @handle https://www.youtube.com/@other
