@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import tempfile
 import unittest
 import urllib.error
@@ -140,7 +141,9 @@ class RunTests(unittest.TestCase):
         (self.base / "channels.txt").write_text(
             f"# comment\n{CH_A}  # Channel A\n{CH_B}  # Channel B\n{CH_C}  # Broken\nnot-an-id\n"
         )
-        self.cfg = dict(yd.DEFAULTS)
+        # These tests cover dedup and catch-up over several days, so they use a
+        # plain rolling window; the weekly reset has its own tests below.
+        self.cfg = dict(yd.DEFAULTS, retain_days=30, weekly_reset=False)
         self.yt = FakeYouTube()
 
     def tearDown(self):
@@ -271,11 +274,11 @@ class PageTests(unittest.TestCase):
         page = self.build()
         feed = self.SITE + "feed.xml"
         self.assertIn(f'<link rel="alternate" type="application/atom+xml" title="YouTube subscriptions (text only)" href="{feed}">', page)
-        self.assertIn(f'<a href="{feed}">', page)
+        self.assertIn(f'<a href="{feed}" target="_blank" rel="noopener noreferrer">', page)
 
     def test_entry_fields(self):
         page = self.build()
-        self.assertIn('<a href="https://www.youtube.com/watch?v=v1">Plain title</a>', page)
+        self.assertIn('<a href="https://www.youtube.com/watch?v=v1" target="_blank" rel="noopener noreferrer">Plain title</a>', page)
         self.assertIn("Channel A", page)
         self.assertIn("Sun 27 Sep 2026, 07:00 BST", page)
         self.assertIn("A summary.", page)
@@ -302,6 +305,72 @@ class AtomTests(unittest.TestCase):
     def test_no_self_link_without_site_url(self):
         root = ET.fromstring(yd.build_atom([], dict(yd.DEFAULTS), yd.ZoneInfo("UTC"), NOW))
         self.assertIsNone(root.find(f"{{{yd.ATOM}}}link"))
+
+
+class WeeklyResetTests(unittest.TestCase):
+    LONDON = yd.ZoneInfo("Europe/London")
+
+    def test_week_start_summer_and_winter(self):
+        # Sunday 27 Sep 2026 09:00 UTC -> Monday 21 Sep 00:00 BST (= 20 Sep 23:00 UTC)
+        self.assertEqual(yd.week_start(self.LONDON, NOW), datetime(2026, 9, 20, 23, 0, tzinfo=timezone.utc))
+        # Just after midnight on a Monday counts as the new week.
+        mon = datetime(2026, 9, 27, 23, 30, tzinfo=timezone.utc)  # Mon 28 Sep 00:30 BST
+        self.assertEqual(yd.week_start(self.LONDON, mon), datetime(2026, 9, 27, 23, 0, tzinfo=timezone.utc))
+        # After the clocks go back, Monday midnight is 00:00 UTC.
+        winter = datetime(2026, 11, 4, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(yd.week_start(self.LONDON, winter), datetime(2026, 11, 2, 0, 0, tzinfo=timezone.utc))
+
+    def run_at(self, base, yt, when):
+        return yd.run(dict(yd.DEFAULTS), base, get=yt, now=when)
+
+    def test_page_starts_fresh_each_monday(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            (base / "channels.txt").write_text(f"{CH_A}  # A\n")
+            yt = FakeYouTube()
+            sunday_night = datetime(2026, 9, 27, 21, 0, tzinfo=timezone.utc)  # Sun 22:00 BST
+            yt.set(CH_A, feed("Channel A", [
+                entry("tue", "Tuesday video", "2026-09-22T12:00:00+00:00", "x", "Channel A"),
+                entry("sun", "Sunday video", "2026-09-27T12:00:00+00:00", "x", "Channel A"),
+                entry("old", "Last week's video", "2026-09-19T12:00:00+00:00", "x", "Channel A"),
+            ]))
+            self.run_at(base, yt, sunday_night)
+            page = (base / "output/index.html").read_text()
+            self.assertIn("Tuesday video", page)
+            self.assertIn("Sunday video", page)
+            self.assertNotIn("Last week's video", page)
+            self.assertIn("2 uploads since Monday 21 September", page)
+
+            # First run after Sunday midnight UK time: last week's items are gone.
+            monday = datetime(2026, 9, 28, 0, 7, tzinfo=timezone.utc)  # Mon 01:07 BST
+            self.run_at(base, yt, monday)
+            page = (base / "output/index.html").read_text()
+            self.assertNotIn("Tuesday video", page)
+            self.assertNotIn("Sunday video", page)
+            self.assertIn("0 uploads since Monday 28 September", page)
+            state = json.loads((base / "state.json").read_text())
+            self.assertEqual(state["items"], {})
+            feed_xml = (base / "output/feed.xml").read_text()
+            self.assertNotIn("<entry>", feed_xml)
+
+            # A new upload that week shows up as normal.
+            yt.set(CH_A, feed("Channel A", [
+                entry("mon", "Monday video", "2026-09-28T08:00:00+00:00", "x", "Channel A"),
+            ]))
+            self.run_at(base, yt, datetime(2026, 9, 28, 12, 17, tzinfo=timezone.utc))
+            self.assertIn("Monday video", (base / "output/index.html").read_text())
+
+    def test_count_shows_total_when_capped(self):
+        v = yd.Video(id="v1", channel_id=CH_A, channel="A", title="t",
+                     url="https://www.youtube.com/watch?v=v1", published=iso(3), summary="s")
+        page = yd.build_html([v], dict(yd.DEFAULTS), self.LONDON, NOW, total=5).decode()
+        self.assertIn("5 uploads since Monday 21 September (newest 1 shown)", page)
+
+    def test_rolling_window_when_reset_is_off(self):
+        cfg = dict(yd.DEFAULTS, weekly_reset=False)
+        self.assertEqual(yd.window_start(cfg, self.LONDON, NOW), NOW - timedelta(days=7))
+        page = yd.build_html([], cfg, self.LONDON, NOW).decode()
+        self.assertIn("0 uploads from the last 7 days", page)
 
 
 class ImportTests(unittest.TestCase):

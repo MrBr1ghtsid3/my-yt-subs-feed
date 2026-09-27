@@ -54,8 +54,9 @@ DEFAULTS = {
     "site_url": "",
     "summary_max_chars": 280,
     "lookback_hours": 48,
-    "retain_days": 30,
-    "feed_max_items": 300,
+    "retain_days": 7,
+    "weekly_reset": True,
+    "feed_max_items": 1000,
     "videos_only": True,
     "workers": 6,
 }
@@ -419,12 +420,38 @@ def _video_href(v: Video) -> str:
     return "https://www.youtube.com/watch?v=" + urllib.parse.quote(v.id)
 
 
-def build_html(items: list[Video], cfg: dict, tz: ZoneInfo, now: datetime) -> bytes:
+def week_start(tz: ZoneInfo, now: datetime) -> datetime:
+    """Most recent Monday 00:00 in the given time zone, returned in UTC."""
+    local = now.astimezone(tz)
+    monday = (local - timedelta(days=local.weekday())).date()
+    return datetime(monday.year, monday.month, monday.day, tzinfo=tz).astimezone(timezone.utc)
+
+
+def window_start(cfg: dict, tz: ZoneInfo, now: datetime) -> datetime:
+    """Oldest upload time kept: retain_days ago, or the weekly reset if that is later."""
+    start = now - timedelta(days=cfg["retain_days"])
+    if cfg["weekly_reset"]:
+        start = max(start, week_start(tz, now))
+    return start
+
+
+NEW_TAB = 'target="_blank" rel="noopener noreferrer"'
+
+
+def build_html(items: list[Video], cfg: dict, tz: ZoneInfo, now: datetime, total: int | None = None) -> bytes:
     """Plain web page of the same items as the feed: no images, no scripts, no external files."""
     esc = html.escape
     title = esc(cfg["feed_title"])
     feed_href = esc(site_link(cfg, "feed.xml"))
-    count = f"{len(items)} upload{'s' * (len(items) != 1)} from the last {cfg['retain_days']} days"
+    total = len(items) if total is None else total
+    plural = "s" * (total != 1)
+    if cfg["weekly_reset"]:
+        since = window_start(cfg, tz, now).astimezone(tz).strftime("%A %d %B")
+        count = f"{total} upload{plural} since {since}"
+    else:
+        count = f"{total} upload{plural} from the last {cfg['retain_days']} days"
+    if len(items) < total:
+        count += f" (newest {len(items)} shown)"
     out = [
         "<!doctype html>",
         '<html lang="en">',
@@ -440,14 +467,14 @@ def build_html(items: list[Video], cfg: dict, tz: ZoneInfo, now: datetime) -> by
         "<header>",
         f"<h1>{title}</h1>",
         f'<p class="meta">{count}. Updated {esc(fmt_local(now, tz))}.</p>',
-        f'<p class="meta"><a href="{feed_href}">Subscribe in a feed reader (feed.xml)</a></p>',
+        f'<p class="meta"><a href="{feed_href}" {NEW_TAB}>Subscribe in a feed reader (feed.xml)</a></p>',
         "</header>",
     ]
     for v in items:
         out += [
             "<article>",
             f'<p class="ch">{esc(v.channel)}</p>',
-            f'<h2><a href="{esc(_video_href(v))}">{esc(v.title)}</a></h2>',
+            f'<h2><a href="{esc(_video_href(v))}" {NEW_TAB}>{esc(v.title)}</a></h2>',
             f'<p class="meta"><time datetime="{esc(v.published)}">{esc(fmt_local(v.published_dt, tz))}</time></p>',
             f"<p>{esc(v.summary)}</p>",
             "</article>",
@@ -494,7 +521,7 @@ def run(
     lookback = now - timedelta(hours=cfg["lookback_hours"])
     if state.get("last_run"):
         lookback = min(lookback, datetime.fromisoformat(state["last_run"]) - timedelta(hours=2))
-    retain = now - timedelta(days=cfg["retain_days"])
+    retain = window_start(cfg, tz, now)
     lookback = max(lookback, retain)
 
     new: list[Video] = []
@@ -513,7 +540,7 @@ def run(
     for rel, data in (
         (cfg["digest_file"], digest.encode("utf-8")),
         (cfg["feed_file"], build_atom(shown, cfg, tz, now)),
-        (cfg["page_file"], build_html(shown, cfg, tz, now)),
+        (cfg["page_file"], build_html(shown, cfg, tz, now, total=len(all_items))),
     ):
         out = base / rel
         out.parent.mkdir(parents=True, exist_ok=True)

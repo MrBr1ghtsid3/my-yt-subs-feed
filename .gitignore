@@ -4,3 +4,4 @@ __pycache__/
 subscriptions.csv
 .env
 _site/
+state.json

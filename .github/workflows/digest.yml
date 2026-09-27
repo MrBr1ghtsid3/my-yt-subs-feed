@@ -2,9 +2,13 @@ name: YouTube feed
 
 on:
   schedule:
-    # Every 3 hours at minute 17, UTC. GitHub often starts scheduled runs
+    # Every 6 hours at minute 17, UTC. GitHub often starts scheduled runs
     # 10-60 minutes late, and off-the-hour minutes are delayed less.
-    - cron: "17 */3 * * *"
+    - cron: "17 */6 * * *"
+    # Weekly reset: an extra run just after Sunday midnight UK time
+    # (Monday 00:07 UTC = 01:07 in UK summer time, 00:07 in winter), so the
+    # page starts the new week promptly. The reset itself is in the script.
+    - cron: "7 0 * * 1"
   workflow_dispatch: {}
 
 concurrency:
@@ -16,25 +20,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write # commit state.json back
+      contents: write # save the memory file to the "state" branch
     steps:
       - uses: actions/checkout@v5
+
+      # The memory file (state.json) lives on its own branch called "state",
+      # which only ever holds one copy. Main never changes, so the repo
+      # doesn't grow with every run.
+      - name: Restore memory file
+        run: |
+          if git fetch --depth=1 origin state 2>/dev/null; then
+            git show FETCH_HEAD:state.json > state.json
+            echo "Restored state.json from the state branch."
+          else
+            echo "No state branch yet; starting fresh."
+          fi
 
       - name: Build feed and page
         run: python3 yt_digest.py run
 
-      - name: Save state
+      - name: Save memory file
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state.json
-          if git diff --cached --quiet; then
-            echo "State unchanged."
-          else
-            git commit -m "Update feed state"
-            git pull --rebase
-            git push
-          fi
+          # One commit with no history, force-pushed over the previous one.
+          blob=$(git hash-object -w state.json)
+          tree=$(printf '100644 blob %s\tstate.json\n' "$blob" | git mktree)
+          commit=$(git commit-tree "$tree" -m "Latest feed state")
+          git push --force origin "$commit:refs/heads/state"
 
       - name: Collect site files
         run: |

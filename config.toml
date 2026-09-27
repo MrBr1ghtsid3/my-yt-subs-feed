@@ -19,8 +19,13 @@ videos_only = true
 # that the digest covers everything since the previous run.
 lookback_hours = 48
 
-# How long seen videos are remembered and kept on the page and in the feed.
-retain_days = 30
+# How long seen videos are kept on the page and in the feed.
+retain_days = 7
+
+# Start fresh every week: from Monday 00:00 (in the time zone above) the
+# page and feed only show uploads published since then. Set to false to
+# keep a rolling window of retain_days instead.
+weekly_reset = true
 
 channels_file = "channels.txt"
 state_file = "state.json"
@@ -28,5 +33,6 @@ page_file = "output/index.html"
 feed_file = "output/feed.xml"
 digest_file = "output/digest.txt"
 feed_title = "YouTube subscriptions (text only)"
-feed_max_items = 300
+# Most items on the page and in the feed (a busy week is ~600).
+feed_max_items = 1000
 workers = 6
